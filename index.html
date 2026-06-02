@@ -1,0 +1,101 @@
+
+    const scoreText = document.getElementById("scoreText");
+    const gradeValue = document.getElementById("gradeValue");
+    const resultList = document.getElementById("resultList");
+    const apiUrl = "/api/check";
+
+    function addResult(title, message, level) {
+      const mark = level === "good" ? "✓" : level === "bad" ? "×" : "!";
+      resultList.appendChild(item);
+    }
+
+    function setGrade(score) {
+      let grade = "D";
+      if (score >= 90) grade = "A";
+      else if (score >= 75) grade = "B";
+      else if (score >= 55) grade = "C";
+    function setGrade(score, grade, text) {
+      gradeValue.textContent = grade;
+      scoreValue.textContent = score;
+      scoreText.textContent = score >= 75 ? "기본 상태가 양호합니다." : "개선할 항목이 있습니다.";
+      scoreText.textContent = text;
+    }
+
+    form.addEventListener("submit", function(event) {
+    form.addEventListener("submit", async function(event) {
+      event.preventDefault();
+      resultList.innerHTML = "";
+      setGrade("--", "?", "검사 중입니다.");
+      addResult("검사 진행", "사이트 응답, SSL 인증서, 보안 헤더를 확인하고 있습니다.", "mid");
+
+      let url;
+      let score = 100;
+      const raw = input.value.trim();
+
+      try {
+          url = new URL("https://" + raw);
+        } catch (secondError) {
+          resultList.innerHTML = "";
+          setGrade(0);
+          setGrade(0, "D", "URL 형식이 올바르지 않습니다.");
+          addResult("URL 형식 오류", "올바른 주소를 입력하세요. 예: https://example.com", "bad");
+          return;
+        }
+
+      input.value = url.href;
+
+      if (url.protocol === "https:") {
+        addResult("HTTPS 사용", "암호화된 HTTPS 주소입니다.", "good");
+      } else {
+        score -= 35;
+        addResult("HTTPS 미사용", "http:// 주소는 로그인 정보와 개인정보가 노출될 수 있습니다.", "bad");
+      }
+      try {
+        const response = await fetch(apiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: url.href })
+        });
+        const data = await response.json();
+        resultList.innerHTML = "";
+
+      if (url.hostname.includes(".")) {
+        addResult("도메인 형식", "도메인 형식이 정상적으로 보입니다.", "good");
+      } else {
+        score -= 20;
+        addResult("도메인 확인 필요", "도메인이 일반적인 공개 사이트 형식이 아닙니다.", "mid");
+      }
+
+      if (url.hostname.startsWith("www.")) {
+        addResult("www 주소", "www 주소는 정상입니다. 루트 도메인도 함께 연결되는지 확인하면 좋습니다.", "good");
+      } else {
+        addResult("루트 도메인", "www 없이 접속하는 주소입니다. www 주소도 같은 사이트로 연결되는지 확인하세요.", "mid");
+      }
+        if (!response.ok) {
+          setGrade(0, "D", "검사를 완료하지 못했습니다.");
+          addResult("검사 실패", data.error || "서버에서 오류가 발생했습니다.", "bad");
+          return;
+        }
+
+      const suspicious = ["login", "admin", "token", "password", "redirect", "callback"];
+      const found = suspicious.filter(function(word) {
+        return url.href.toLowerCase().includes(word);
+      });
+
+      if (found.length) {
+        score -= 18;
+        addResult("민감한 URL 단어", "주소에 " + found.join(", ") + " 같은 단어가 있습니다. 공개 링크로 공유할 때 주의하세요.", "mid");
+      } else {
+        addResult("민감 단어", "주소에서 흔한 민감 단어는 발견되지 않았습니다.", "good");
+        const summary = data.finalUrl === data.requestedUrl ? "실제 서버 응답 기준 검사 결과입니다." : "리다이렉트 후 최종 주소 기준 검사 결과입니다.";
+        setGrade(data.score, data.grade, summary);
+        data.checks.forEach(function(check) {
+          addResult(check.title, check.message, check.level);
+        });
+      } catch (error) {
+        resultList.innerHTML = "";
+        setGrade(0, "D", "API 서버 연결이 필요합니다.");
+        addResult("API 연결 실패", "GitHub 저장소를 Vercel에 연결해서 배포하면 실제 검사가 작동합니다.", "bad");
+      }
+
+      if (url.search.length > 0) {
