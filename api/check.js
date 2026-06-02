@@ -96,19 +96,81 @@ function getCertificate(hostname) {
       const authorized = socket.authorized;
       const authorizationError = socket.authorizationError || null;
       socket.end();
-      resolve({
-        authorized,
-        authorizationError,
-        validTo: cert.valid_to || null,
-        subject: cert.subject || null,
-        issuer: cert.issuer || null
-      });
+      resolve({ authorized, authorizationError, validTo: cert.valid_to || null });
     });
     socket.on("error", () => resolve({ authorized: false, authorizationError: "연결 실패", validTo: null }));
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve({ authorized: false, authorizationError: "타임아웃", validTo: null });
+    socket.on("timeout", () => { socket.destroy(); resolve({ authorized: false, authorizationError: "타임아웃", validTo: null }); });
+  });
+}
+
+// ── Google Safe Browsing ──
+async function checkGoogleSafeBrowsing(url) {
+  const apiKey = process.env.GOOGLE_SAFE_BROWSING_KEY;
+  if (!apiKey) return null;
+
+  const body = JSON.stringify({
+    client: { clientId: "url-security-checker", clientVersion: "2.0" },
+    threatInfo: {
+      threatTypes: ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+      platformTypes: ["ANY_PLATFORM"],
+      threatEntryTypes: ["URL"],
+      threatEntries: [{ url }]
+    }
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: "safebrowsing.googleapis.com",
+      path: `/v4/threatMatches:find?key=${apiKey}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      timeout: 8000
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed.matches || []);
+        } catch { resolve(null); }
+      });
     });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── VirusTotal ──
+async function checkVirusTotal(url) {
+  const apiKey = process.env.VIRUSTOTAL_KEY;
+  if (!apiKey) return null;
+
+  const encoded = Buffer.from(url).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: "www.virustotal.com",
+      path: `/api/v3/urls/${encoded}`,
+      method: "GET",
+      headers: { "x-apikey": apiKey },
+      timeout: 10000
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          const stats = parsed?.data?.attributes?.last_analysis_stats;
+          if (!stats) { resolve(null); return; }
+          resolve(stats);
+        } catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
   });
 }
 
@@ -125,7 +187,6 @@ function gradeFromScore(score) {
   return "D";
 }
 
-// ── 항목별 해결 방법 ──
 const FIX_GUIDES = {
   "HTTPS 미사용": {
     steps: [
@@ -191,7 +252,7 @@ const FIX_GUIDES = {
     steps: [
       "리다이렉트 자체가 위험하진 않지만 여러 번 발생하면 속도가 느려집니다.",
       "최종 URL을 직접 사용하거나, 불필요한 중간 리다이렉트를 제거하세요.",
-      "www → non-www (또는 반대) 리다이렉트는 1회만 발생하도록 설정하세요."
+      "www → non-www 리다이렉트는 1회만 발생하도록 설정하세요."
     ],
     link: null
   },
@@ -213,53 +274,113 @@ module.exports = async function handler(req, res) {
     return res.status(204).end();
   }
 
-  if (req.method !== "POST") {
-    return send(res, 405, { error: "POST만 허용됩니다." });
-  }
+  if (req.method !== "POST") return send(res, 405, { error: "POST만 허용됩니다." });
 
   const { url: rawUrl } = req.body || {};
   if (!rawUrl) return send(res, 400, { error: "url 필드가 없습니다." });
 
   let target;
-  try {
-    target = new URL(rawUrl);
-  } catch {
-    return send(res, 400, { error: "URL 형식이 올바르지 않습니다." });
-  }
+  try { target = new URL(rawUrl); }
+  catch { return send(res, 400, { error: "URL 형식이 올바르지 않습니다." }); }
 
-  try {
-    await resolvePublicHost(target.hostname);
-  } catch {
-    return send(res, 400, { error: "내부 IP 또는 확인할 수 없는 호스트입니다." });
-  }
+  try { await resolvePublicHost(target.hostname); }
+  catch { return send(res, 400, { error: "내부 IP 또는 확인할 수 없는 호스트입니다." }); }
 
   const checks = [];
 
   function addCheck(title, message, level) {
     const guide = FIX_GUIDES[title] || null;
-    checks.push({
-      title,
-      message,
-      level,
-      fix: (level === "bad" || level === "mid") && guide ? guide : null
-    });
+    checks.push({ title, message, level, fix: (level === "bad" || level === "mid") && guide ? guide : null });
   }
 
+  // ── 1. Google Safe Browsing ──
+  const [gsbMatches, vtStats] = await Promise.all([
+    checkGoogleSafeBrowsing(target.href),
+    checkVirusTotal(target.href)
+  ]);
+
+  if (gsbMatches === null) {
+    checks.push({ title: "Google Safe Browsing", message: "API 키 미설정 또는 오류로 검사를 건너뜁니다.", level: "mid", fix: null });
+  } else if (gsbMatches.length > 0) {
+    const types = [...new Set(gsbMatches.map(m => m.threatType))].join(", ");
+    checks.push({
+      title: "⚠️ Google: 위험 사이트 감지",
+      message: `Google Safe Browsing에서 위협이 감지됐습니다: ${types}. 즉시 접속을 중단하세요!`,
+      level: "bad",
+      fix: {
+        steps: [
+          "이 사이트는 Google이 악성/피싱 사이트로 분류했습니다.",
+          "절대 개인정보나 결제 정보를 입력하지 마세요.",
+          "이미 접속했다면 비밀번호를 즉시 변경하고 백신 검사를 실행하세요."
+        ],
+        link: "https://safebrowsing.google.com/safebrowsing/report_badware/"
+      }
+    });
+  } else {
+    checks.push({ title: "Google Safe Browsing 통과", message: "Google 위협 데이터베이스에 등록된 악성 사이트가 아닙니다.", level: "good", fix: null });
+  }
+
+  // ── 2. VirusTotal ──
+  if (vtStats === null) {
+    checks.push({ title: "VirusTotal", message: "API 키 미설정 또는 분석 데이터 없음으로 검사를 건너뜁니다.", level: "mid", fix: null });
+  } else {
+    const malicious = vtStats.malicious || 0;
+    const suspicious = vtStats.suspicious || 0;
+    const total = Object.values(vtStats).reduce((a, b) => a + b, 0);
+
+    if (malicious > 0) {
+      checks.push({
+        title: `⚠️ VirusTotal: ${malicious}개 엔진 위협 감지`,
+        message: `${total}개 보안 엔진 중 ${malicious}개가 악성, ${suspicious}개가 의심스럽다고 판정했습니다.`,
+        level: "bad",
+        fix: {
+          steps: [
+            "여러 보안 엔진이 이 사이트를 위험하다고 판단했습니다.",
+            "절대 파일을 다운로드하거나 개인정보를 입력하지 마세요.",
+            "이미 파일을 받았다면 즉시 삭제하고 백신 전체 검사를 실행하세요.",
+            "virustotal.com에서 직접 상세 결과를 확인할 수 있습니다."
+          ],
+          link: `https://www.virustotal.com/gui/url/${Buffer.from(target.href).toString("base64").replace(/=/g,"")}`
+        }
+      });
+    } else if (suspicious > 0) {
+      checks.push({
+        title: `VirusTotal: ${suspicious}개 엔진 의심`,
+        message: `${total}개 보안 엔진 중 ${suspicious}개가 의심스럽다고 판정했습니다. 주의가 필요합니다.`,
+        level: "mid",
+        fix: {
+          steps: [
+            "일부 보안 엔진이 이 사이트를 의심스럽다고 판단했습니다.",
+            "개인정보 입력이나 파일 다운로드는 피하세요.",
+            "virustotal.com에서 상세 결과를 확인해보세요."
+          ],
+          link: `https://www.virustotal.com/gui/url/${Buffer.from(target.href).toString("base64").replace(/=/g,"")}`
+        }
+      });
+    } else {
+      checks.push({
+        title: "VirusTotal 통과",
+        message: `${total}개 보안 엔진 모두 위협 없음으로 판정했습니다.`,
+        level: "good",
+        fix: null
+      });
+    }
+  }
+
+  // ── 3. HTTPS ──
   if (target.protocol === "https:") {
     checks.push({ title: "HTTPS 사용", message: "암호화된 HTTPS 주소입니다.", level: "good", fix: null });
   } else {
     addCheck("HTTPS 미사용", "http:// 주소는 개인정보가 노출될 수 있습니다.", "bad");
   }
 
+  // ── 4. 접속 및 리다이렉트 ──
   let fetchResult;
   try {
     fetchResult = await fetchWithRedirects(target.href);
   } catch (err) {
     return send(res, 200, {
-      requestedUrl: rawUrl,
-      finalUrl: rawUrl,
-      score: 0,
-      grade: "D",
+      requestedUrl: rawUrl, finalUrl: rawUrl, score: 0, grade: "D",
       checks: [{ title: "접속 실패", message: err.message || "사이트에 연결할 수 없습니다.", level: "bad", fix: null }]
     });
   }
@@ -277,6 +398,7 @@ module.exports = async function handler(req, res) {
     addCheck("응답 오류", `HTTP ${status} 오류 응답입니다.`, "bad");
   }
 
+  // ── 5. SSL ──
   if (target.protocol === "https:") {
     const cert = await getCertificate(target.hostname);
     if (cert.authorized) {
@@ -292,6 +414,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // ── 6. 보안 헤더 ──
   const headers = fetchResult.headers || {};
   const secHeaders = [
     { key: "strict-transport-security", title: "HSTS" },
@@ -310,11 +433,5 @@ module.exports = async function handler(req, res) {
   const score = scoreChecks(checks);
   const grade = gradeFromScore(score);
 
-  return send(res, 200, {
-    requestedUrl: rawUrl,
-    finalUrl: fetchResult.finalUrl,
-    score,
-    grade,
-    checks
-  });
+  return send(res, 200, { requestedUrl: rawUrl, finalUrl: fetchResult.finalUrl, score, grade, checks });
 };
